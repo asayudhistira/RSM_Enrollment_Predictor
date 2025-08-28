@@ -1,0 +1,1634 @@
+---
+title: " Predicting RSM Masters Enrollemnt - Machine Learning and Learning Algorithms (BM05BAM) Project"
+author: "Rajata Utensute (Pian), Asa Yudhistira, Rakeen Akiel, Francho Garcia (Group 30)"
+date: "2023-12-12"
+output: 
+  html_document:
+    df_print: paged
+    highlight: pygments
+    theme: flatly
+  pdf_document: default
+  editor_options:
+    chunk_output_type: console
+---
+# Problem and Goal
+
+- There is a lot of preparation that has to go into each start of the academic year. One important such task is classroom allocation for all the different Masters programs.
+- This is usually done much before September, so the administration does not know with certainty how many students each program will have, and by extension, the class room size they will need to accommodate sair number of students. 
+- An accurate predictive model will solve critical issues, such as having to frantically find new and available rooms for programs that end up having more students than the classrooms allow for. 
+- This predictive model will thus have to make predictions for the number of students that will enrol for each program by September, but make this predictions with data only up to March 15th. 
+- Thus, the goal is to make this prediction as accurate as possible, keeping in mind the above regarding March 15th, and considering the problems that having programs with more students than the classrooms allow and/or that consistently over-predicting can cause. 
+
+# Relevant Libraries
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(ggplot2)
+library(ggthemes)
+library(knitr)
+library(rsample)
+library(lubridate)
+library(xgboost)
+library(ranger)
+library(psych)
+library(yardstick)
+library(pROC)
+library(themis)
+set.seed(123)
+```
+
+# Data
+Importing Data
+```{r}
+load("offers_censored.RData")
+```
+
+Importing the helpful functions 
+```{r}
+source("helpful_functions.R")
+```
+
+Data split based on year
+```{r}
+# Data Split based on year
+years_and_max_dates <- function(x) {
+  x |>
+    group_by(AppYear) |>
+    summarise(
+      `Num observations` = n(),
+      `Max \`AppDate\`` = max(AppDate),
+      `Max \`OfferDate\`` = max(OfferDate),
+      `Max \`ResponseDate\`` = max(ResponseDate, na.rm = TRUE),
+      `\`ResponseDate\` is NA` = sum(is.na(ResponseDate))
+    )
+}
+```
+
+Censor the entire data
+```{r}
+full_censored_data <-
+  offers |>
+  # change responses received after March 14 to "Unknown"
+  censor_post_prediction_responses() |>
+  # drop offers sent out after March 14
+  drop_post_prediction_offers() 
+```
+
+## Feature Engineering
+We want to consider our data to be cross-sectional. Hence, it is important for us to remove time variables (AppYear, AppDate, OfferDate, etc). However, these variables contain important information for our prediction. Hence, we will not be able to remove them fully from our analysis. Instead we conduct the following feature engineering:
+
+To prevent leakage from the Response Date column, the entire column will be replaced by a binary variable that has a value 1 if applicants responded before March 15 and 0 if applicants did not provide an answer before march 15 (NAs in the data set).
+```{r}
+full_censored_data$Respond_by_0315 <- ifelse(is.na(full_censored_data$ResponseDate), 0, 1) #if na (No response by march 15), then the value is 0 
+```
+
+Create a new feature for the difference between Application Date and Offer Date
+```{r}
+# We think that the difference between the two dates is the most important temporal information
+full_censored_data$Difference_App_Off <- full_censored_data$OfferDate - full_censored_data$AppDate 
+```
+
+Create a new feature for March 15 of the academic year
+```{r}
+#Used later to calculate the difference between application date and prediction date for every year
+full_censored_data$March15_AcademicYear <- as.Date(paste(full_censored_data$AppYear, "-03-15", sep="")) 
+```
+
+Calculate the difference in days to March 15th
+```{r}
+#We think that there is a correlation between how fast you applied with the probability of enrolling.
+#March 15 here is completely arbitrary, as long as this variable is able to capture how early an application is
+#relative to the academic year, it will be fine. 
+full_censored_data$Difference_to_March15 <- full_censored_data$March15_AcademicYear - full_censored_data$AppDate
+```
+
+Converting the newly generated features into their appropriate data types
+```{r}
+# Convert to correct data types
+full_censored_data$Difference_App_Off <- as.numeric(as.character(full_censored_data$Difference_App_Off))
+
+full_censored_data$Difference_to_March15 <- as.numeric(as.character(full_censored_data$Difference_to_March15))
+
+full_censored_data$AppYearFactor <- as.factor(full_censored_data$AppYear)
+```
+
+With these feature engineering in mind, we decided that the following predictors (AppYear, AppDate, ResponseDate, OfferDate and March15_AcademicYear) will be set as metadata.
+
+## Data Splitting
+
+Analysis Set (Data from 2020 and 2021)
+
+- The year 2020 and 2021 provide a historical data, ensuring that future information is not incorporated in the initial model training.
+
+Assessment Set (Data from 2022)
+
+- It is crucial that predictive model maintain a chronological order.
+- By selecting 2022 as assessment set, we ensure that the assessment follows immediately the year used in the analysis set and that our model is assess on recent but not future years.
+- This approach tests the model’s ability to predict future trends based on historical data.
+
+Final Training Set (Data from 2021 and 2022)
+
+- We adopted a rolling training method.
+- We prioritizes recent trends by using the latest data 
+- We recognize the diminished relevance of 2020 data due to changes in enrollment pattern post-pandemic.
+
+Create the analysis-assessment split on the data
+```{r}
+set.seed(123) #Belt and Suspenders :)
+
+#Create a split 
+analysis_assesment_split <-
+    full_censored_data |> 
+    filter(AppYear < 2023) |>
+    make_appyear_split(test_year = 2022)
+```
+
+Extract the analysis set and assessment set from the analysis assessment split
+```{r}
+analysis_set <- training(analysis_assesment_split) # 2020 + 2021 data
+assessment_set <- testing(analysis_assesment_split) # 2022 data
+```
+
+Subsequently, the next crucial step is to examine class imbalance of the target variable in the data set. 
+Notably, we see that there is slight class imbalance in our data set, and the key question is whether we should downsample or upsample our data set.
+
+At the end, we decided to go with upsampling. Upsampling helps reduce the bias towards the majority class, allowing model to learn pattern more equitably. We chose this instead of downsampling because we feel that downsampling would lead to loss of valuable data. 
+
+```{r}
+analysis_set |>
+  count(Status) |>
+  mutate(prop = n/ sum(n))
+```
+Since, we have roughly a 60/40 split on enrolled vs not enrolled students in the analysis set, and ...
+
+Create 5-folds cross validation with stratification on Status to prevent class imbalance
+```{r}
+set.seed(123) #Belt and suspenders :)
+cv_folds <- analysis_set |> 
+  vfold_cv(v = 5, strata = "Status") #You can add repeats here 
+```
+
+Checking that the proportion of the target variable's class is roughly identical throughout the whole data set, which is done by examining the proportion between the two classes in our cross validation for the n-1 folds and the left out fold for the third split: 
+```{r}
+training(cv_folds$splits[[3]]) |> count(Status) |> mutate(n = n/sum(n)) # 0.622 for enrolled and 0.378 for not enrolled
+testing(cv_folds$splits[[3]]) |> count(Status) |> mutate(n = n/sum(n)) # 0.622 for enrolled and 0.378 for not enrolled
+```
+
+Making the final training set
+```{r}
+#Similar steps as before
+final_training_prediction_df <- 
+  offers |> 
+  filter(AppYear >= 2021) |> 
+  censor_post_prediction_responses() |>
+  drop_post_prediction_offers() 
+
+#Feature engineering for the final train test split 
+final_training_prediction_df$Respond_by_0315 <- ifelse(is.na(final_training_prediction_df$ResponseDate), 0, 1)
+final_training_prediction_df$Difference_App_Off <- final_training_prediction_df$OfferDate - final_training_prediction_df$AppDate 
+final_training_prediction_df$March15_AcademicYear <- as.Date(paste(final_training_prediction_df$AppYear, "-03-15", sep=""))
+final_training_prediction_df$Difference_to_March15 <- final_training_prediction_df$March15_AcademicYear - final_training_prediction_df$AppDate
+final_training_prediction_df$Difference_App_Off <- as.numeric(as.character(final_training_prediction_df$Difference_App_Off))
+final_training_prediction_df$Difference_to_March15 <- as.numeric(as.character(final_training_prediction_df$Difference_to_March15))
+final_training_prediction_df$AppYearFactor <- as.factor(final_training_prediction_df$AppYear)
+
+final_training_prediction_split <-
+  final_training_prediction_df |> 
+  make_appyear_split(test_year = 2023)
+
+final_train <- training(final_training_prediction_split)
+final_test <- testing(final_training_prediction_split)
+
+final_train |>
+  group_by(AppYear) |>
+  count() #shows only 2021 and 2022 in the train
+
+final_test |>
+  group_by(AppYear) |>
+  count() #shows only 2023
+```
+
+# Exploratory Data Analyses
+
+<details>
+<summary>
+**EDA**
+</summary>
+## Exploratory Data Analysis 
+```{r}
+skim(analysis_set)
+```
+Our analysis set comprised of 2,366 observations, as we decided to perform censoring for training, validation, and testing observations. There are a number of missing values for `ResponseDate` which could be problematic for the random forest model, so we will update it's role as metadata. Instead, we create a dummy variable `Respond_by_0315` which is equal to 1 for observations that responded by the cut-off date March 15th, else 0. We can see that variables capture different characteristics that are each expressed in different units of measurement and scales, thus we will consider normalizing features for various models. 
+
+```{r}
+skew(analysis_set$App4)
+skew(analysis_set$Difference_App_Off)
+```
+We also see that variables such as `App4` and `Difference_App_Off` are somewhat right-skewed in the `skim()` histograms, but a skewness test does not indicate a significant amount of skewness. Lastly, we see that only 65.5% of observations have responded to the offer of admission by the prediction date of March 15th, showing that on average over a third of individuals do not definitively say if they will or will not start attending in September, before the prediction has to be made. 
+
+```{r}
+#Stacked bar plot of Status per program but not standardized. 
+data_freq_Program2 <- analysis_set %>%
+  group_by(Program, Status) %>%
+  summarise(Frequency = n(), .groups = 'drop')  # drop group structure after summarising
+#Plotting: 
+ggplot(data_freq_Program2, aes(x = Program, y = Frequency, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +  # stack bars to show total frequency per program
+  labs(x = "Program", y = "Frequency", fill = "Status") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+The stacked bar chart above shows the proportion of enrolled and not enrolled individuals for each masters program. Apart from showing us the proportions of `Status` per program, showing us which programs experience the most "no-shows" and vice versa, it also visualizes very well how many individuals are offered a spot for each program. The obvious stand out is MSc Finance, which had around 900 offers, for which about 375 did not end up enrolling. It seems, that in most cases, more than half of candidates end up enrolling. Perhaps the exception is MScBA-MIM, for which there seems to be a majority which does not enroll. The differences shown in the status class across programs may suggest that this is an important feature. 
+
+```{r}
+#Stacked bar chart for Status outcomes across Demo1: 
+data_freq_demo1 <- analysis_set %>%
+  group_by(Demo1, Status) %>%
+  summarise(Frequency = n(), .groups = 'drop') %>%
+  mutate(Total = sum(Frequency)) %>%
+  mutate(Proportion = Frequency / Total)
+#plotting:
+ggplot(data_freq_demo1, aes(x = Demo1, y = Frequency, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 1)), 
+            position = position_stack(vjust = 0.5), 
+            size = 4, color = "white") +
+  labs(x = "Demo1", y = "Frequency", fill = "Status") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() 
+
+```
+This stacked bar chart shows the proportions of the outcome Status across the `Demo1` variable. It shows that there are over 400 more "V" individuals than "U", and that they they comprise a bigger portion of enrollments by 12%. It is important to note that the labels show the proportions to the whole dataset, and not per `Demo1` factor. As such, we can say for example that 37% of all individuals are of type "V" and enrolled, followed then by individuals of type "U" also enroled, etc. 
+
+```{r}
+#PLotting Status Outcomes across Demo2; 
+data_freq_demo2 <- analysis_set %>%
+  group_by(Demo2, Status) %>%
+  summarise(Frequency = n(), .groups = 'drop') %>%
+  mutate(Total = sum(Frequency)) %>%
+  mutate(Proportion = Frequency / Total)
+#plot: 
+ggplot(data_freq_demo2, aes(x = Demo2, y = Frequency, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 1)), 
+            position = position_stack(vjust = 0.5), 
+            size = 3, color = "white") +
+  labs(x = "Demo2", y = "Frequency", fill = "Status") +
+  theme_minimal() 
+```
+We can also see stark differences for the `Demo2` variable. This shows that factor "X" is very under-represented, and that most of them do not enroll, whereas factors "W" and "Y" have more individuals enrolled than not. This is especially the case for "Y" individuals, who are the most prevalent in the data, and also have over 75% of their group be enrolled. It seems like this variable will also be an important feature for the models. 
+
+
+```{r}
+#Stacked bar chart for Edu2: 
+analysis_set %>%
+  mutate(Edu2 = fct_infreq(Edu2)) %>%  # Reorder levels of Edu2 based on frequency
+  ggplot(aes(x = Edu2, fill = Status)) +
+  geom_bar(position = "fill") +
+  labs(x = "Edu2", y = "Proportion", fill = "Status") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+The above stacked bar chart is "standardised" for all factors of `Edu2`. This makes it harder to see which factor is more common in the data, but allows us to make much clearer comparisons for the `Status` outcome. For example, we can see that for individuals belong to "FK" are the most likely to enroll, as close to 75% of them enroll. This is followed by "BY" and "KT", who also have high enrollment proportions. In comparison, less than 10% of "UF", "SS", and "XR" individuals end up enrolling. 
+
+
+```{r}
+#Stacked Bar plot for App1:
+data_freq_app1 <- analysis_set %>%
+  count(App1, Status) %>%
+  group_by(App1) %>%
+  mutate(Total = sum(n)) %>%
+  mutate(Proportion = n / Total) %>%
+  ungroup()  
+ggplot(data_freq_app1, aes(x = App1, y = n, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1), 
+                y = cumsum(n) - 0.5 * n), 
+            color = "white", size = 3, vjust = 0.5) +
+  labs(x = "App1", y = "Count", fill = "Status") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() 
+```
+The above bar chart shows an extreme imbalance in the prevalence of "S" and "T" factors of `App1`. There are only 250 of the prior but over 2000 for the latter. We also wee slight differences in their outcomes for `Status`, but it is not drastic. 
+
+```{r}
+#Stacked Bar plot for App2:
+data_freq_app2 <- analysis_set%>%
+  count(App2, Status) %>%
+  group_by(App2) %>%
+  mutate(Total = sum(n)) %>%
+  mutate(Proportion = n / Total) %>%
+  ungroup()
+ggplot(data_freq_app2, aes(x = App2, y = n, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack")  +
+  labs(x = "App2", y = "Count", fill = "Status") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+For the above, we see a significant amount of variation in the factors of `App2` in the data-set. By far the most common is "Q", whilst there are barely any observations for factors "B", "N", "O", and "P". This may pose difficulties for our models to make predictions for such individuals. 
+
+
+```{r}
+#Stacked Bar plot for App3:
+data_freq_app3 <- analysis_set %>%
+  count(App3, Status) %>%
+  group_by(App3) %>%
+  mutate(Total = sum(n)) %>%
+  mutate(Proportion = n / Total) %>%
+  ungroup()  
+ggplot(data_freq_app3, aes(x = App3, y = n, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "App3", y = "Count", fill = "Status") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() 
+```
+We again see that there is a significant imbalance between factors "A" and "B" of `App3`. However, there should be a sufficient sample size for both. We can see however, there are drastic differences in the outcome class depending on the factor of this variable; individuals belonging to "A", on average, seem to be much more likely to enroll (proportionally) than individuals of "B". This indicates that this should be also a good feature for the models. 
+
+```{r}
+data_freq_howfirstheard <- analysis_set %>%
+  count(HowFirstHeard, Status) %>%
+  group_by(HowFirstHeard) %>%
+  mutate(Total = sum(n)) %>%
+  mutate(Proportion = n / Total) %>%
+  ungroup()
+
+ggplot(data_freq_howfirstheard, aes(x = HowFirstHeard, y = n, fill = Status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "How First Heard", y = "Count", fill = "Status") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.position = "bottom")
+```
+Lastly, we can also visualize the relationship between how individuals heard of the program/university and the proportions of enrollment. We see that most individuals hears from current students at RSM, and that these candidates also, on average, have high rates of enrollment. We see that family/friends/relatives and web are also very popular mediums by which candidates hear about the programs. 
+
+```{r}
+data_freq_hfh2 <- analysis_set %>%
+  group_by(HowFirstHeard, Status) %>%
+  summarise(Frequency = n(), .groups = 'drop') %>%
+  group_by(HowFirstHeard) %>%
+  mutate(Proportion = Frequency / sum(Frequency)) %>%
+  ungroup() 
+
+data_freq_hfh2
+```
+A table summarizing the frequency of each type of `HowFirstHeard` and the proportions of `Status` helps see the outcomes for less frequent mediums. We again see that the medium most conducive to enrollments are current students, followed by marketing materials (although with a sample size of 9), and education fairs or events. 
+
+</details>
+
+
+
+# Decision Regarding Assessment Metrics
+The metric we choose to measure prediction quality is F1 Score.
+
+- We identify that both Sensitivity and Precision are equally important for our model.
+- Sensitivity is important because we want to ensure that instances of allocating a classroom that is too small for the number of students in a program does not happen. 
+- We do so by deliberately seeking a low False Negative count, which is equal to predicting a candidate will not enroll when they will in fact do so. 
+- If this number is large, we will chronically be allocating classrooms that are too small. 
+- Precision is also important, as we don’t want to over-predict and create too many False Positives, as this will make it harder to allocate rooms, if more programs are battling for the bigger rooms. This could lead to inefficiencies. 
+- The F1 score provides a reasonable balance between these two goals. 
+- We will include sensitivity, precision, accuracy and roc_auc as secondary metrics.
+
+```{r}
+class_metrics <- metric_set(
+  f_meas, sensitivity, precision, 
+  accuracy, roc_auc
+)
+```
+
+# Modelling
+## K-Nearest Neighbors Classification
+Setting up the model
+```{r}
+knn_class_model <- 
+    nearest_neighbor(neighbors = tune()) |>
+    set_mode('classification') |>
+    set_engine('kknn')
+```
+Setting up the recipe.
+The predictors AppYear, AppDate, ResponseDate, OfferDate and March15_AcademicYear will be made into meta data for all the models.
+```{r}
+knn_class_recipe <-
+    #We use all variables, and set some predictors to MetaData
+    recipe(Status ~ ., 
+            data = analysis_set) |>
+    update_role(c(ResponseDate,AppDate, OfferDate, March15_AcademicYear, AppYear),new_role = 'MetaData') |>
+    step_dummy(all_nominal_predictors()) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_upsample(Status)
+```
+Setting up the workflow
+```{r}
+knn_class_wf <- 
+    workflow() |>
+    add_model(knn_class_model) |>
+    add_recipe(knn_class_recipe)
+knn_class_wf
+```
+
+Setting up the tuning grid
+```{r}
+set.seed(123)
+knn_class_tune_grid <- tibble(neighbors = 20:100*5 +1) #Create tune grid
+knn_class_tune_grid
+```
+
+Tuning the grid generated earlier
+```{r}
+knn_class_tune_results_2020_2021 <-
+    knn_class_wf |> 
+    tune_grid(
+    resamples = cv_folds,
+    grid = knn_class_tune_grid,
+    metrics = class_metrics
+    )
+```
+Then, we collect all the metrics and visualize the tuning grid for knn
+```{r}
+knn_class_tune_metrics <-
+    knn_class_tune_results_2020_2021 |>
+    collect_metrics()
+
+knn_class_tune_metrics |>
+  ggplot(aes(x = neighbors, y = mean)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_bw()
+```
+
+The best hyper parameter is
+```{r}
+#get 5 best models based on fmeas
+knn_class_tune_results_2020_2021 |>
+  show_best("f_meas", n = 5) |>
+  arrange(desc(mean), desc(neighbors))
+```
+
+By applying the one standard error rule, we obtain the following hyperparameter
+```{r}
+#Best model within 1SE (simpler)
+knn_class_model <-
+  knn_class_tune_results_2020_2021 |>
+  select_by_one_std_err(metric = "f_meas", desc(neighbors)) # neighbors = 306
+knn_class_model
+```
+
+
+
+Ultimately, we finalize the workflow
+```{r}
+knn_class_wf_tuned <-
+  knn_class_wf |>
+  finalize_workflow(knn_class_model)
+```
+
+Fit the model for the last time with the 2020 and 2021 data and estimate the test metrics using the 2022 data
+```{r}
+knn_final_fit <-
+  knn_class_wf_tuned |>
+  last_fit(
+    analysis_assesment_split, metrics = class_metrics
+  )
+```
+
+And we collect the estimation of the test metrics
+```{r}
+knn_metrics <-
+  knn_final_fit |>
+  collect_metrics()
+knn_metrics
+```
+
+For better visualization so that we can combine it with other model later, we store the results in a data frame with its respective model name
+```{r}
+knn_metrics <- 
+  knn_metrics |> 
+  select(.metric, .estimate) |> 
+  mutate(model = "knn")
+knn_metrics
+```
+
+## Regularization
+Setting up the recipe for regularization models
+```{r}
+glmnet_recipe <- 
+  recipe(Status ~., data = analysis_set) |> 
+  update_role(c(ResponseDate,AppDate, OfferDate, March15_AcademicYear, AppYear),new_role = 'MetaData') |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_upsample(Status) 
+```
+
+### Ridge-Penalized Logistic Regression
+Setting up the model
+```{r}
+ridge_logistic_reg <- 
+  logistic_reg(penalty = tune(), mixture = 0) |> 
+  set_engine("glmnet")
+ridge_logistic_reg |> translate()
+```
+
+Setting up the workflow
+```{r}
+ridge_wf <- 
+  workflow() |> 
+  add_recipe(glmnet_recipe) |> 
+  add_model(ridge_logistic_reg)
+```
+
+Setting up the tuning grid.
+`grid_ridge` contains 100 points ranging from \(10^{-2.5}\) to \(10^1\). The 100 points in the grid are arranged such that the exponent \(q\) in \(10^q\) are spaced equally between -2.5 to 1.
+```{r}
+set.seed(123)
+grid_ridge <- 
+  grid_regular(
+    penalty(
+      range = c(-2.5, 1), 
+      trans = log10_trans()
+    ), 
+    levels = 100
+  )
+grid_ridge
+```
+
+Tune the grid
+```{r}
+ridge_tune <- 
+  ridge_wf |> 
+  tune_grid(
+    resamples = cv_folds, 
+    grid = grid_ridge, 
+    metrics = class_metrics
+  )
+```
+
+Collect the metrics and create a plot 
+```{r}
+ridge_tune_metrics <-
+  ridge_tune |> 
+  collect_metrics()
+
+ridge_tune_metrics |> 
+  filter(.metric == "f_meas") |> 
+  ggplot(aes(
+    x = penalty, y = mean, 
+    ymin = mean - std_err, ymax = mean + std_err
+  )) + 
+  geom_pointrange(alpha = 0.5, size = 0.125) + 
+  scale_x_log10() + 
+  labs(y = "f_meas", x = expression(lambda)) + 
+  theme_bw()
+```
+
+The very best hyperparameter is
+```{r}
+ridge_tune |> select_best(metric = "f_meas", desc(penalty)) # penalty =  0.0503524
+```
+
+By applying the one standard error rule, we obtain
+```{r}
+ridge_1se_model <-
+  ridge_tune |>   
+  select_by_one_std_err(metric = "f_meas", desc(penalty))
+ridge_1se_model # penalty = 0.1450829
+```
+
+Finalize the workflow
+```{r}
+ridge_wf_tuned <- 
+  ridge_wf |> 
+  finalize_workflow(ridge_1se_model)
+ridge_wf_tuned
+```
+
+#### Lasso-Penalized Logistic Regression
+Setting up the model
+```{r}
+lasso_logistic_reg <- 
+  logistic_reg(penalty = tune(), mixture = 1) |> 
+  set_engine("glmnet")
+lasso_logistic_reg |> translate()
+```
+
+Setting up the workflow
+```{r}
+lasso_wf <- 
+  workflow() |> 
+  add_recipe(glmnet_recipe) |> 
+  add_model(lasso_logistic_reg)
+```
+
+Setting up the tuning grid.
+`grid_lasso` contains 100 points ranging from \(10^{-2.5}\) to \(10^{-1}\). The 100 points in the grid are arranged such that the exponent \(q\) in \(10^q\) are spaced equally between -2.5 to -1.
+
+```{r}
+grid_lasso <- 
+  grid_regular(
+    penalty(
+      range = c(-2.5, -1),
+      trans = log10_trans()
+    ), 
+    levels = 100
+  )
+grid_lasso
+```
+
+Tune the grid
+```{r}
+set.seed(123)
+lasso_tune <- 
+  lasso_wf |> 
+  tune_grid(
+    resamples = cv_folds, 
+    grid = grid_lasso,
+    metrics = class_metrics
+  )
+```
+
+Collect the metrics and create a plot
+```{r}
+lasso_tune_metrics <-
+  lasso_tune |> 
+  collect_metrics() 
+
+lasso_tune_metrics |> 
+  filter(.metric == "f_meas") |> 
+  ggplot(aes(
+    x = penalty, y = mean, 
+    ymin = mean - std_err, ymax = mean + std_err
+  )) + 
+  geom_pointrange(alpha = 0.5, size = 0.125) + 
+  scale_x_log10() + 
+  labs(y = "f_meas", x = expression(lambda)) + 
+  theme_bw()
+```
+
+The very best hyperparameter is
+```{r}
+lasso_tune |> select_best(metric = "f_meas", desc(penalty)) # penalty = 0.02477076
+```
+
+By applying the one standard error rule, we obtain
+```{r}
+lasso_1se_model <- 
+  lasso_tune |> 
+  select_by_one_std_err(metric = "f_meas", desc(penalty))
+lasso_1se_model # penalty = 0.05722368	
+```
+
+Finalize the workflow
+```{r}
+lasso_wf_tuned <- 
+  lasso_wf |> 
+  finalize_workflow(lasso_1se_model)
+lasso_wf_tuned
+```
+
+### Elastic Net Logistic Regression
+
+Setting up the model
+```{r} 
+elastic_net_logistic_reg <- 
+  logistic_reg(penalty = tune(), mixture = tune()) |> 
+  set_engine("glmnet")
+elastic_net_logistic_reg |> translate()
+```
+
+Setting up the workflow
+```{r}
+elastic_net_wf <- 
+  workflow() |> 
+  add_recipe(glmnet_recipe) |> 
+  add_model(elastic_net_logistic_reg)
+```
+
+Setting up the tuning grid.
+`grid_elastic_net` contains 100 points ranging from \(10^{-4}\) to \(10^1\). The 100 points in the grid are arranged such that the exponent \(q\) in \(10^q\) are spaced equally between -4 to 1.
+
+```{r}
+set.seed(123)
+grid_elastic_net <- 
+  grid_regular(
+    penalty(
+      range = c(-4, 1), 
+      trans = log10_trans()
+    ),
+    levels = 50
+  )
+# Create a sequence for the mixture parameter
+mixture_values <- tibble(mixture = seq(0.2, 0.8, length.out = 4))
+# Combine grids using crossing
+grid_elastic_net <- crossing(grid_elastic_net, mixture_values)
+# Arrange (if necessary)
+grid_elastic_net <- arrange(grid_elastic_net, mixture, penalty)
+grid_elastic_net
+```
+
+Tune the grid
+```{r}
+elastic_net_tune <- 
+  elastic_net_wf |> 
+  tune_grid(
+    resamples = cv_folds, 
+    grid = grid_elastic_net,
+    metrics = class_metrics
+  ) |>
+  suppressWarnings()
+```
+
+Collect the metrics and create a plot
+```{r}
+elastic_net_tune_metrics <-
+  elastic_net_tune |> 
+  collect_metrics() 
+elastic_net_tune_metrics |>
+  filter(.metric == "f_meas") |>
+  ggplot(aes(
+    x = penalty, y = mean, colour = factor(mixture),
+    ymin = mean - std_err, ymax = mean + std_err
+  )) +
+  geom_pointrange(alpha = 0.5, size = .125) +
+  scale_x_log10() +
+  labs(y = "f_meas", x = expression(lambda), colour = expression(alpha)) +
+  theme_bw() |>
+  suppressWarnings()
+```
+
+The best hyperparameters for each of the regularization models are
+```{r}
+elastic_net_tune |> select_best(metric = "f_meas", desc(penalty)) # penalty = 0.07196857	#mixture=0.4
+```
+
+Then, we apply the one standard error rule:
+```{r}
+elastic_net_1se_model <- 
+  elastic_net_tune |> 
+  select_by_one_std_err(metric = "f_meas", desc(penalty))
+elastic_net_1se_model # penalty = 0.1456348 mixture = 0.2	
+```
+
+Finalize the workflows
+```{r}
+elastic_net_wf_tuned <- 
+  elastic_net_wf |> 
+  finalize_workflow(elastic_net_1se_model)
+elastic_net_wf_tuned
+```
+
+### Regularization Examinations
+Here, we will compare the results of the three models. 
+For Ridge-penalized logistic regression:
+```{r}
+ridge_last_fit <- 
+  ridge_wf_tuned |> 
+  last_fit(analysis_assesment_split, metrics = class_metrics)
+ridge_test_metrics <- 
+  ridge_last_fit |> 
+  collect_metrics()
+ridge_test_metrics
+```
+
+For Lasso-penalized logistic regression:
+```{r}
+lasso_last_fit <-
+  lasso_wf_tuned |>
+  last_fit(analysis_assesment_split, metrics = class_metrics)
+lasso_test_metrics <-
+  lasso_last_fit |>
+  collect_metrics()
+lasso_test_metrics
+```
+
+For Elastic net logistic regression:
+```{r}
+elastic_net_last_fit <- 
+  elastic_net_wf_tuned |> 
+  last_fit(analysis_assesment_split, metrics = class_metrics)
+elastic_net_test_metrics <-
+  elastic_net_last_fit |> 
+  collect_metrics()
+elastic_net_test_metrics
+```
+
+Then, we express the results in a data frame for better visualizations
+```{r}
+lasso_test_metrics <-
+  lasso_test_metrics |>
+  select(.metric, .estimate) |>
+  mutate(model = "lasso")
+
+ridge_test_metrics <-
+  ridge_test_metrics |>
+  select(.metric, .estimate) |>
+  mutate(model = "ridge")
+
+elastic_net_test_metrics <-
+  elastic_net_test_metrics |>
+  select(.metric, .estimate) |>
+  mutate(model = "elastic net")
+
+regularization_test_metrics <- 
+  bind_rows(lasso_test_metrics, ridge_test_metrics, elastic_net_test_metrics) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(desc(f_meas))
+
+regularization_test_metrics
+```
+
+## Random Forest Classification
+### Random Forests: Model
+```{r}
+#Step 1: Model
+rf_model_tune <- 
+  #We will tune the number for the random subset of predictors at each split
+  rand_forest(mtry = tune(),
+              min_n = tune(),
+              trees = 1000) |>
+  set_mode("classification") |>
+  set_engine("ranger", importance = "permutation")
+```
+The first step is to define a Random Forest (RF) model, where mtry() (the number of random predictors available to choose from at each split) and min_n() (the minimum number of observations at leaf nodes) are set to be tuned. Furthermore, for this task we set the mode to classification.
+```{r}
+#Step 2: Recipe 
+rf_recipe <-
+  #We pass in the relevant variables and the data
+  recipe(Status ~ ., data = analysis_set) |>
+  # we exclude the irrelevant variables
+  update_role(c(ResponseDate,AppDate,AppYear, OfferDate, March15_AcademicYear),new_role = 'MetaData') |>
+  #We will create dummies for nominal predictors, remove 0 var cols, and normalise
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_upsample(Status)
+```
+We have some variables which we remove as predictors as either they are leaky or have missing values, which can be problematic for RF models. We create dummies for the nominal predictors, and normalise all numeric predictors to account for their different scales and units of measurement. 
+```{r}
+#Step 3: Workflow
+rf_tune_wf <-
+  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model_tune)
+```
+We define the workflow and pass in the recipe and the model.
+### RF Tuning & Parameter Selection
+```{r}
+num_cores <- parallel::detectCores()
+num_cores
+doParallel::registerDoParallel(cores = num_cores - 1L)
+```
+
+We define an initial tuning grid to train the first tuning results of the RF model:
+```{r}
+set.seed(123)
+rf_tune_grid <- grid_regular(mtry(range = c(1, 17)), levels = 10,
+                             min_n(range = c(1,50)))
+```
+We then pass in the tuning grid, with the workflow to be tuned across all folds and assessed using the pre-defined metrics: 
+```{r}
+initial_rf_tune_res <-
+  tune_grid(
+    rf_tune_wf,
+    resamples = cv_folds,
+    grid = rf_tune_grid,
+    metrics = class_metrics)
+```
+We then use the initial tuning the results to pass in to the tuning that uses tune_bayes(), which more efficiently searches the range of possible values for the parameters: (However this is not reproducible)
+```{r}
+# rf_tune_res_1 <-
+#   rf_tune_wf |>
+#   tune_bayes(
+#     resamples = cv_folds,
+#     initial = initial_rf_tune_res,
+#     iter = 1,
+#     param_info =
+#       parameters( mtry(range = c(1,17)),
+#                   min_n(range = c(1,100))),
+#     metrics = class_metrics)
+```
+We continue with the tuning: 
+```{r}
+rf_tune_max_mtry <-
+  initial_rf_tune_res |>
+  collect_metrics() |> 
+  filter(.metric == "f_meas") |> 
+  group_by(mtry) |> 
+  slice_max(mean)
+
+key <-
+  rf_tune_max_mtry |>
+  select(mtry, min_n) 
+key
+
+fin_rf_mtry_metrics <- 
+  initial_rf_tune_res |>
+  collect_metrics() |>
+  inner_join(key, by = c("mtry" = "mtry", "min_n" = "min_n")) |>
+  #filter(.metric == "f_meas") |> 
+  arrange(desc(mean))
+fin_rf_mtry_metrics
+```
+Because we have multiple observations for each value of mtry (because of many min_n), we are limiting our choices to the highest value of f_meas for each mtry value. This is done such that choosing a model based on the one standard error rule will be simplfied. 
+
+```{r}
+fin_rf_mtry_metrics |>
+  filter(.metric %in% c("sensitivity", "precision")) |>
+  ggplot(aes(x = mtry, y = mean, ymin = mean - std_err,
+             ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() + 
+  geom_line() +
+  geom_point() +
+  scale_colour_manual(values = c("#D55E00", "#0072B2")) +
+  facet_wrap(~.metric, ncol = 1, scales = "free_y") +
+  guides(colour = 'none') +
+  theme_bw()
+```
+
+From the graph above we see that a value of mtry() of 5 levels off the mean performance on precision at around 0.935 without much subsequent improvement, and that conversely, it also levels off sensitivity at a value of around 0.925. However, the standard errors are quite small, so that the performance could indeed be statistically significantly different. 
+
+```{r}
+fin_rf_mtry_metrics |>
+  filter(.metric == "f_meas") |>
+  ggplot(aes(x = mtry, y = mean, ymin = mean - std_err,
+             ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() + 
+  geom_line() +
+  geom_point() +
+  scale_colour_manual(values = "navy") +
+  facet_wrap(~.metric, ncol = 1, scales = "free_y") +
+  guides(colour = 'none') +
+  theme_bw()
+```
+
+However, when we examine the plot for the F1 metric (which combines precision and sensitivity), we see that a higher value achieves a better balance. 
+
+
+We will use the 1 standard error rule so as to not select the model with too much complexity, such as a high mtry() or low min_n() value, to prevent over fitting. We examine the best 1SE model for each parameter with regard to f_meas with the following: 
+```{r}
+fin_rf_mtry_metrics |>
+  filter(.metric == 'f_meas') |>
+  arrange(desc(mean))
+```
+It can be seen if we manually apply the 1SE rule, we will choose the model with m_try == 13 and min_n == 11
+```{r}
+
+initial_rf_tune_res |>
+  collect_metrics() |>
+  filter(mtry == 13 & min_n == 11) |>
+  filter(.metric == 'f_meas')
+
+selected_rf <- 
+  initial_rf_tune_res |>
+  collect_metrics() |>
+  filter(mtry == 13 & min_n == 11) |>
+  filter(.metric == 'f_meas')
+```
+
+And finalize the workflow: 
+```{r}
+#Finalising the workflow: 
+rf_final_wf <- finalize_workflow(rf_tune_wf, selected_rf)
+rf_final_wf 
+
+#Final Fit 
+rf_final_fit <- 
+  rf_final_wf |>
+  last_fit(analysis_assesment_split, metrics = class_metrics)
+```
+
+
+### RF Performance Evaluation 
+
+```{r}
+#Collecting metrics: 
+rf_metrics <-
+  rf_final_fit |>
+  collect_metrics()
+rf_metrics
+```
+
+<details>
+<summary>
+**Ranking Metrics**
+</summary>
+We see that the model achieves an f1 score which lies between the precision and sensitivity, which makes sense. The best of which is precision. We will now look at a confusion matrix to better see how it does with regard to predicting positive and negative cases. 
+
+```{r}
+#Confusion Matrix 
+rf_final_fit |> 
+  collect_predictions() |> 
+  conf_mat(truth = Status, estimate = .pred_class) 
+```
+We see that our model has considerably more false negatives than false positives. In the context of the task, this means that it missed on a number of individuals who do end up enrolling more so than it falsely predicts people will enroll when in fact they don't.  and again shows that the precision is higher than sensitivity. It is important that the model does not under predict the number of students that will show up, so as to not allocate rooms that are too small, but on the flipside, overpredicting the number of people that will show up who actually don't (FP) can lead to allocating to classes that are too big, which can cause a strain if all the programs are asking for the big lecture rooms. 
+
+```{r}
+#ROC Curve x
+rf_final_fit |> 
+  collect_predictions() |> 
+  roc_curve(Status, .pred_Enrolled) |> 
+  autoplot()
+```
+
+The receiver operating curve charts the false positive rate against sensitivity. The best model will have a perfect sensitivity with a 0 false positive rate (which corresponds with the top-left corner). We can see that our model gets pretty close.  
+
+```{r}
+#Lift curve
+rf_final_fit |> 
+  collect_predictions() |> 
+  lift_curve(Status, .pred_Enrolled) |> 
+  autoplot()
+```
+
+Whilst the value of 1.6 is not very high, ti is still much better than random guess-work. It is also impressive that it remains constant for over 60% of cases tested. 
+
+```{r}
+rf_final_fit |> 
+  collect_predictions() |> 
+  gain_curve(Status, .pred_Enrolled) |> 
+  autoplot()
+```
+
+The results shown by the chart also seem quite positive. It shows that the model is capable of correctly finding most of the positive outcome cases (around 95%) for around 60% of the observations it is most confident about. It again shows, that it is quite good at identifying positive cases.
+</details>
+
+## Gradient Boosted Decision Trees
+Setting up a model
+```{r}
+xgb_model_tune <- 
+  boost_tree(
+    trees = tune(),
+    tree_dept = tune(),
+    learn_rate = tune(),
+    stop_iter = 500
+  ) |>
+  set_mode('classification') |>
+  set_engine('xgboost')
+```
+Setting up a recipe
+```{r}
+xgb_recipe <-
+  recipe(Status ~ .,data = analysis_set) |>
+  update_role(c(ResponseDate,AppDate, OfferDate, March15_AcademicYear, AppYear),new_role = 'MetaData') |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_upsample(Status) 
+```
+Setting up a workflow
+```{r}
+xgb_tune_wf <- 
+  workflow() |>
+  add_recipe(xgb_recipe) |> 
+  add_model(xgb_model_tune)
+xgb_tune_wf
+```
+
+Parallel processing to speed up computation:
+```{r}
+num_cores <- parallel::detectCores()
+doParallel::registerDoParallel(cores = num_cores - 1L)
+```
+Setting up tuning grid
+```{r}
+set.seed(123)
+xgb_grid <-  crossing(
+  trees = 250 * 1:40,
+  learn_rate = c(0.1,0.01,0.001),
+  tree_depth = c(1,2,3)
+)
+```
+Tuning the grid generated earlier
+```{r}
+xgb_tune_res <- 
+  tune_grid(
+    xgb_tune_wf,
+    resamples = cv_folds,
+    grid = xgb_grid,
+    metrics = class_metrics
+  )
+```
+Extract the metrics
+```{r}
+xgb_tune_metrics <-
+  xgb_tune_res |>
+  collect_metrics()
+xgb_tune_metrics
+```
+Plot the f_meas:
+```{r}
+xgb_tune_metrics |>
+  filter(.metric == "f_meas") |>
+  ggplot(aes(
+    x = trees, y = mean,
+    colour = factor(tree_depth)
+  )) +
+  geom_path() +
+  labs(y = "f_meas") +
+  scale_colour_manual(values = c("#D55E00", "#0072B2", "#009E73")) +
+  facet_wrap(~learn_rate) +
+  labs(colour = "tree_depth") +
+  theme_bw() +
+  theme(
+    legend.position = c(.98, .98),
+    legend.justification = c(1, 1),
+    legend.background = element_rect(colour = "black")
+  )
+```
+
+First, we observe that for learn_rate = 0.1 the model is very sensitive to
+the number of trees. For learning rate = 0.001, we observe that for learn_rate == 0.001, the model's performance
+is relatively similar for tree_depth == 2 and 3. Lastly, for learn_rate == 0.01 all three models behave similarly.
+
+We will now look at other metrics as well. 
+Plot the sensitivity:
+```{r}
+xgb_tune_metrics |>
+  filter(.metric == "sensitivity") |>
+  ggplot(aes(
+    x = trees, y = mean,
+    colour = factor(tree_depth)
+  )) +
+  geom_path() +
+  labs(y = "sensitivity") +
+  scale_colour_manual(values = c("#D55E00", "#0072B2", "#009E73")) +
+  facet_wrap(~learn_rate) +
+  labs(colour = "tree_depth") +
+  theme_bw() +
+  theme(
+    legend.position = c(.98, .98),
+    legend.justification = c(1, 1),
+    legend.background = element_rect(colour = "black")
+  )
+```
+
+Similar trends can be seen in the plot for sensitivity.
+
+Plot the precision next:
+```{r}
+xgb_tune_metrics |>
+  filter(.metric == "precision") |>
+  ggplot(aes(
+    x = trees, y = mean,
+    colour = factor(tree_depth)
+  )) +
+  geom_path() +
+  labs(y = "precision") +
+  scale_colour_manual(values = c("#D55E00", "#0072B2", "#009E73")) +
+  facet_wrap(~learn_rate) +
+  labs(colour = "tree_depth") +
+  theme_bw() +
+  theme(
+    legend.position = c(.98, .98),
+    legend.justification = c(1, 1),
+    legend.background = element_rect(colour = "black")
+  )
+```
+
+Whereas for precision, learn rate = 0.001 the performance is stable to the tree_depth used and trees.
+However, learn_rate = 0.01 & 0.1 is more sensitive to trees.
+
+Plot accuracy and f meas:
+```{r}
+xgb_tune_metrics |>
+  filter(.metric %in% c("f_meas", "accuracy")) |>
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_grid(learn_rate ~ tree_depth, labeller = label_both) +
+  scale_colour_manual(values = c("#D55E00", "#0072B2")) +
+  theme_bw() +
+  labs(y = NULL) +
+  theme(
+    legend.position = c(.98, .2),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(colour = "black")
+  )
+```
+
+It can be seen that f_meas and accuracy is shown to agree on every single hyperparameter combination.
+So in conclusion, we want to focus on learn_rate == 0.001 & 0.01
+```{r}
+#This plot also supports the idea of not using learn rate = 0.1. Furthermore, the lack of variability in tree_depth = 1 and learn rate =0.001
+#is not very convincing. 
+xgb_tune_metrics |>
+  filter(learn_rate < 0.1) |>
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(
+    id_cols = trees:learn_rate,
+    names_from = .metric,
+    values_from = mean
+  ) |>
+  ggplot() +
+  aes(
+    x = precision, y = sensitivity,
+    colour = factor(trees, ordered = TRUE),
+    size = learn_rate
+  ) +
+  geom_point() +
+  facet_wrap(~tree_depth, ncol = 1, labeller = label_both) +
+  scale_size_continuous(range = c(2, 4), breaks = 10^c(-3, -2)) +
+  scale_colour_viridis_d(begin = .3, end = .9, option = "D") +
+  theme_bw() +
+  labs(colour = "trees")
+```
+
+It can be seen that for learn_rate 0.01 (bigger dots) that a tree_depth of 3 and 2 shows great varition in performance.
+Whereas for tree_depth 1 we can see that number of trees somewhat agree with one another. 
+Lastly, it is hard to see for learn rate 0.001 (so we are going to keep these observations). 
+
+Therefore, we will choose between (learn_rate == 0.01 & tree_depth 1) or (learn_rate == 0.001)
+``` {r}
+xgb_tune_metrics |>
+  filter((learn_rate == 0.01 & tree_depth == 1) |(learn_rate == 0.001))|>
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(
+    id_cols = trees:learn_rate,
+    names_from = .metric,
+    values_from = mean
+  ) |>
+  ggplot() +
+  aes(
+    x = precision, y = sensitivity,
+    colour = factor(trees, ordered = TRUE),
+    size = learn_rate
+  ) +
+  geom_point() +
+  facet_wrap(~tree_depth, ncol = 1, labeller = label_both) +
+  scale_size_continuous(range = c(2, 4), breaks = 10^c(-3, -2)) +
+  scale_colour_viridis_d(begin = .3, end = .9, option = "D") +
+  theme_bw() +
+  labs(colour = "trees")
+```
+
+We can see that for tree_depth == 3 & learn_rate == 0.001, it is still sensitive to number of trees, so we will drop these observations.
+```{r}
+xgb_tune_metrics |>
+  filter((learn_rate == 0.01 & tree_depth == 1) |(learn_rate == 0.001 & tree_depth < 3))|>
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(
+    id_cols = trees:learn_rate,
+    names_from = .metric,
+    values_from = mean
+  ) |>
+  ggplot() +
+  aes(
+    x = precision, y = sensitivity,
+    colour = factor(trees, ordered = TRUE),
+    size = learn_rate
+  ) +
+  geom_point() +
+  facet_wrap(~tree_depth, ncol = 1, labeller = label_both) +
+  scale_size_continuous(range = c(2, 4), breaks = 10^c(-3, -2)) +
+  scale_colour_viridis_d(begin = .3, end = .9, option = "D") +
+  theme_bw() +
+  labs(colour = "trees")
+```
+
+We can see that within the clusters left, the performance does not differ by a significant margin. 
+However, with boosting there is always a risk of overfitting if you have too much trees. 
+Therefore, we will focus on observations of tree_depth == 1, learn_rate == 0.01 with a lower tree value.
+```{r}
+xgb_tune_metrics |>
+  filter(learn_rate == 0.01 & tree_depth == 1 & trees <= 5000) |>
+  select(trees:learn_rate, .metric, mean, std_err) |>
+  filter(.metric %in% c("sensitivity", "precision")) |>
+  mutate(low = mean - std_err, high = mean + std_err) |>
+  select(-std_err) |>
+  pivot_wider(
+    id_cols = trees:learn_rate,
+    names_from = .metric,
+    values_from = c(mean, low, high)
+  ) |>
+  select(trees, precision = mean_precision, ends_with("sensitivity")) |>
+  ggplot() +
+  aes(
+    x = precision,
+    y = mean_sensitivity, ymin = low_sensitivity, ymax = high_sensitivity,
+    colour = factor(trees, ordered = TRUE)
+  ) +
+  geom_pointrange() +
+  geom_text(aes(label = trees), position = position_nudge(y = .001)) +
+  scale_colour_viridis_d(begin = .3, end = .95, option = "E") +
+  theme_bw() +
+  labs(colour = "trees")
+
+```
+
+From this plot we see the tree value that has a good balance of  both sensitivity and precision is 1500
+So, we choose a model with trees = 1500, tree_depth = 1, and learn_rate = 0.01.
+
+Since there seems to be no trade off between sensitivity and precision, this decision is relatively straight forward.
+```{r}
+xgb_tune_metrics |>
+  filter(trees == 1500 & tree_depth == 1 & learn_rate == 0.01)
+```
+```{r}
+xgb_tune_metrics |>
+  filter(tree_depth == 1 & learn_rate == 0.01 & .metric == 'f_meas') |>
+  arrange(desc(mean))
+```
+We can see that trees == 1500, tree_depth == 1, and learn_rate 0.001 also corresponds to the best performing model in terms of f_meas.
+```{r}
+xgb_tune_metrics |>
+  filter(tree_depth == 1 & learn_rate == 0.01 & .metric == 'f_meas' & trees <= 1500) |>
+  arrange(desc(mean))
+```
+
+If we do one standard error below this model and try to find a simpler model with less number of trees, we arrive at a trees value equal to 250 (simplest possible model in this grid). 
+
+Now, we can finalise the workflow.
+```{r}
+selected_xgb <- 
+  xgb_tune_metrics|>
+  filter(tree_depth == 1, learn_rate == 0.01, trees == 250) |>
+  distinct(trees, tree_depth, learn_rate)
+
+xgb_final_wf <-
+  finalize_workflow(xgb_tune_wf, selected_xgb)
+xgb_final_wf
+```
+```{r}
+xgb_final_fit <-
+  xgb_final_wf |>
+  last_fit(
+    analysis_assesment_split, metrics = class_metrics
+  )
+```
+
+```{r}
+xgb_test_metrics <-
+  xgb_final_fit |>
+  collect_metrics() |> 
+  select(.metric,.estimate) |>
+  mutate(model = 'xgb')
+xgb_test_metrics
+```
+```{r}
+rf_metrics_final <-
+  rf_metrics |>
+  select(.metric,.estimate) |>
+  mutate(model = 'rf')
+```
+
+Combine the results of all 6 models:
+```{r}
+xgb_knn_regularization_rf_test_metrics <- 
+  bind_rows(knn_metrics, lasso_test_metrics, ridge_test_metrics, elastic_net_test_metrics, xgb_test_metrics,rf_metrics_final) |> 
+  pivot_wider(names_from = .metric, values_from = .estimate) |> 
+  arrange(desc(f_meas))
+xgb_knn_regularization_rf_test_metrics 
+```
+
+We will choose lasso because it performs the best. While xgb has the upper edge compared to lasso on roc_auc, because of lasso's simplicity, we will choose lasso. Quoting Occam's Razor, we will always choose a simpler model over a more complicated model if the performance is the same.
+
+Additionally, Lasso has a few benefits. They include: 
+
+- Explainability: Lasso is a model that is built on top of a Simple Linear Regression, so it is much more simpler to explain how the model creates its predictions. People at the admissions office will be able to rationalize how the enrollment process is for students This opens up the possibility of the admissions office to alter their application process to better fit their intended outcome. 
+- Lower of risk of overfitting compared to more complicated models.
+- Very simple and Cost efficient!
+
+# Predictions
+Next, we will call last_fit() and pass in the final/prediction split object. We include roc_auc as a metric in order for last_fit() to automatically generate soft predictions. 
+```{r}
+final_metric <- metric_set(f_meas, roc_auc)
+final_model <-
+  lasso_wf_tuned |>
+  last_fit(final_training_prediction_split,
+    metrics = final_metric
+  ) |>
+  suppressWarnings()
+```
+
+After fitting the model, we generate the prediction for each program. We have decided to use a threshold of 0.45. The reason for this include: 
+
+- We want to capture less false negatives
+- Underprediction is dangerous because we will not be able to allocate the programs to appropriately sized rooms. 
+- However, we avoided going any lower due to the fact that we already did upsampling because this made our model more sensitive to the negative class in general.
+```{r}
+final_model_df <- 
+  final_model |>
+  augment() |>
+  group_by(Program) |> 
+  summarise(
+    Predicted_N = sum(.pred_Enrolled >= 0.45),
+    Predicted_Prob = mean(.pred_Enrolled)
+  )
+final_model_df 
+```
+
+# Implementing New uncensored data
+```{r}
+load('offers_uncensored.RData')
+```
+The following steps will be similar to what we have done at the start of the file.
+```{r}
+full_uncensored_data <-
+  offers |>
+  # change responses received after March 14 to "Unknown"
+  censor_post_prediction_responses() |>
+  # drop offers sent out after March 14
+  drop_post_prediction_offers() 
+```
+## Feature Engineering
+Same steps as previously
+```{r}
+full_uncensored_data$Respond_by_0315 <- ifelse(is.na(full_uncensored_data$ResponseDate), 0, 1)
+full_uncensored_data$Difference_App_Off <- full_uncensored_data$OfferDate - full_uncensored_data$AppDate 
+full_uncensored_data$March15_AcademicYear <- as.Date(paste(full_uncensored_data$AppYear, "-03-15", sep=""))
+full_uncensored_data$Difference_to_March15 <- full_uncensored_data$March15_AcademicYear - full_uncensored_data$AppDate
+full_uncensored_data$Difference_App_Off <- as.numeric(as.character(full_uncensored_data$Difference_App_Off))
+full_uncensored_data$Difference_to_March15 <- as.numeric(as.character(full_uncensored_data$Difference_to_March15))
+full_uncensored_data$AppYearFactor <- as.factor(full_uncensored_data$AppYear)
+```
+
+## Data Splitting
+```{r}
+set.seed(123)
+analysis_assesment_split_uncensored <-
+    full_uncensored_data |> 
+    filter(AppYear > 2020) |>
+    make_appyear_split(test_year = 2023)
+```
+
+## Analysis
+```{r}
+train <- training(analysis_assesment_split_uncensored) # 2021 + 2022 data
+test <- testing(analysis_assesment_split_uncensored) # 2023 data
+```
+
+## Fit The best model 
+```{r}
+lasso_last_fit_final <-
+  lasso_wf_tuned |>
+  last_fit(analysis_assesment_split_uncensored, metrics = class_metrics)
+
+lasso_test_metrics_final <-
+  lasso_last_fit_final |>
+  collect_metrics()
+
+lasso_test_metrics_final
+```
+
+## Predictions 
+```{r}
+pred_table <- 
+  final_model_df <- 
+  lasso_last_fit_final |>
+  augment() |>
+  group_by(Program) |> 
+  summarise(
+    Predicted_N = sum(.pred_Enrolled >= 0.45)
+  )
+
+act <-
+  lasso_last_fit_final |>
+  augment() |>
+  group_by(Program) |> 
+  count(Status) |>
+  filter(Status == 'Enrolled') |>
+  select(!Status) |>
+  rename(actual_n = n)
+
+
+act_pred_comp_prog <- merge(pred_table,act, by = 'Program')
+act_pred_comp_prog
+```
+
+Obtain the confusion matrix with our specified threshold
+```{r}
+#Apply our threshold
+lasso_last_fit_final_new_thres <-
+  lasso_last_fit_final |>
+  collect_predictions() |>
+  mutate(.pred_class = as.factor(ifelse(.pred_Enrolled >= 0.45, "Enrolled", "Not enrolled"))) 
+
+lasso_last_fit_final_new_thres |>
+  conf_mat(Status, .pred_class)
+```
+
+We can see that our model works really well in predicting negative cases. We only had one instance of False Positives, whereas we have 40 instances of False Negatives. 
+
+
+We get the estimated coefficients oflasso.
+```{r}
+lasso_last_fit_final |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  arrange(desc(abs(estimate))) 
+```
+
+We see that  out of the possible 158 variables, only 6 was selected by the lasso model.
+Namely, Response is shown to have a high predictive power because all four categories are selected.
+Additionally, the difference between Demo2_Y and the reference group Demo2_W is also important.
+Lastly, the dummy variable that we generated `Respond_by_0315` is also important.
+
+```{r}
+lasso_last_fit_final |>
+  extract_fit_parsnip() |>
+  autoplot() +
+  theme_bw()
+```
+
+We can also see that ‘Respond_by_0315’ is the feature that was shrunk last given an increasing penalty in the lasso model.
+
+
+## Check where the model miss-classified
+```{r}
+lasso_last_fit_final |>
+  augment() |>
+  filter(Status != .pred_class) 
+```
+
+We found 41 observations where our prediction was wrongly classified.
+
+
+```{r}
+enrollment_actual_program <- lasso_last_fit_final |>
+  augment() |> 
+  filter(Status == 'Enrolled') |>
+  group_by(Program) |>
+  count(Program) |>
+  arrange(desc(n)) |>
+  rename(actual_enrollments = n)
+
+enrollment_program <- 
+  lasso_last_fit_final |>
+  augment() |>
+  filter(Status != .pred_class) |>
+  group_by(Program) |>
+  count(Program) |>
+  arrange(desc(n)) |>
+  rename(missprediction = n)
+
+enrollment_error <- merge(enrollment_program, enrollment_actual_program, by = "Program")
+
+enrollment_error |>
+  mutate(
+    miss_prediction_share = missprediction/actual_enrollments
+  ) 
+```
+
+The table above provide an overview on which programs did we make wrong classifications.
+
+See where in predictor Demo2 did our model make wrong classification.
+```{r}
+lasso_last_fit_final |>
+  augment() |>
+  filter(Status != .pred_class) |>
+  group_by(Demo2) |>
+  count(Demo2) |>
+  arrange(desc(n))
+```
+
+We observe that out of the 41 observations, most of the misclassification on Demo2 occurs on variable Y. 
+
+See where in predictor Response did our model make wrong classification.
+```{r}
+lasso_last_fit_final |>
+  augment() |>
+  filter(Status != .pred_class) |>
+  group_by(Response) |>
+  count(Response) |>
+  arrange(desc(n))
+```
+
+We observe that out of the 41 observations, most of the misclassification on Response occurs on variable Unknown.
+
+This can be further checked with the code below
+```{r}
+lasso_last_fit_final |>
+  augment() |>
+  filter(Status != .pred_class) |>
+  group_by(Respond_by_0315) |>
+  count(Respond_by_0315) |>
+  arrange(desc(n))
+```
+
+
+ROC curve
+```{r}
+lasso_last_fit_final |>
+  collect_predictions() |>
+  roc_curve(Status, .pred_Enrolled) |>
+  autoplot()
+```
+
+We observe that the ROC curve indicate that our model performs similarly to a theoretical ‘Perfect Model’ because our curve hugs the top left hand corner. 
+
+Gain curve:
+```{r}
+lasso_last_fit_final |>
+  collect_predictions() |>
+  gain_curve(Status, .pred_Enrolled) |>
+  autoplot()
+```
+
+We can see that the gain curve indicates that we also perform really well relative to the ‘Perfect Model’ Indicated by the shaded region. 
+
+End of Project
+```{}
+beepr::beep()
+```
